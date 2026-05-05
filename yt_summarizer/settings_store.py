@@ -8,6 +8,7 @@ import json
 import logging
 import os
 from dataclasses import asdict, dataclass, field
+from typing import Any
 
 logger = logging.getLogger(__name__)
 
@@ -17,10 +18,18 @@ DEFAULT_SETTINGS_PATH = os.path.join(PROJECT_ROOT, "data", "gui_settings.json")
 
 
 @dataclass
+class ChannelEntry:
+    """YouTube channel ID plus optional display label for the UI."""
+
+    channel_id: str
+    label: str = ""
+
+
+@dataclass
 class GuiSettings:
     """User-editable settings shared by the GUI and optional CLI merge."""
 
-    channels: list[str] = field(default_factory=list)
+    channels: list[ChannelEntry] = field(default_factory=list)
     use_openai_cloud: bool = False
     llm_base_url: str = "http://127.0.0.1:11434/v1"
     llm_model: str = "llama3.2"
@@ -39,7 +48,9 @@ class GuiSettings:
 
 def default_gui_settings() -> GuiSettings:
     return GuiSettings(
-        channels=["UCk-DG0N8StZ0T9Dv8XpVLZw"],
+        channels=[
+            ChannelEntry(channel_id="UCk-DG0N8StZ0T9Dv8XpVLZw", label=""),
+        ],
     )
 
 
@@ -51,6 +62,35 @@ def ensure_data_dir(path: str) -> None:
     parent = os.path.dirname(os.path.abspath(path))
     if parent:
         os.makedirs(parent, exist_ok=True)
+
+
+def _normalize_channel(obj: Any) -> ChannelEntry | None:
+    """Accept legacy strings or dicts from JSON."""
+    if isinstance(obj, ChannelEntry):
+        return obj
+    if isinstance(obj, str):
+        return ChannelEntry(channel_id=obj.strip(), label="") if obj.strip() else None
+    if isinstance(obj, dict):
+        cid = (obj.get("channel_id") or obj.get("id") or "").strip()
+        if not cid:
+            return None
+        lab = str(obj.get("label") or obj.get("name") or "").strip()
+        return ChannelEntry(channel_id=cid, label=lab)
+    return None
+
+
+def _normalize_channels_list(raw: Any) -> list[ChannelEntry]:
+    if not raw:
+        return []
+    out: list[ChannelEntry] = []
+    for item in raw:
+        if isinstance(item, ChannelEntry):
+            out.append(item)
+            continue
+        ch = _normalize_channel(item)
+        if ch is not None:
+            out.append(ch)
+    return out
 
 
 def load_gui_settings() -> GuiSettings:
@@ -72,8 +112,11 @@ def load_gui_settings() -> GuiSettings:
     base = default_gui_settings()
     data = asdict(base)
     for k, v in raw.items():
+        if k == "channels":
+            continue
         if k in data:
             data[k] = v
+    data["channels"] = _normalize_channels_list(raw.get("channels", data["channels"]))
     return GuiSettings(**data)
 
 
@@ -89,7 +132,7 @@ def save_gui_settings(settings: GuiSettings) -> None:
 
 
 def channel_list_for_config_merge() -> list[str] | None:
-    """Return channels from gui_settings.json if that file exists (may be empty)."""
+    """Return channel IDs from gui_settings.json if that file exists (may be empty)."""
     path = gui_settings_path()
     if not os.path.isfile(path):
         return None
@@ -97,4 +140,4 @@ def channel_list_for_config_merge() -> list[str] | None:
         s = load_gui_settings()
     except Exception:
         return None
-    return s.channels
+    return [c.channel_id for c in s.channels]

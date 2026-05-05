@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -16,6 +17,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QLineEdit,
     QListWidget,
+    QListWidgetItem,
     QMainWindow,
     QMessageBox,
     QProgressBar,
@@ -30,11 +32,15 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
 from yt_summarizer.channel_monitor import VideoRef
 from yt_summarizer.summarize import FinalSummary
 from yt_summarizer.ollama_check import ollama_origin_from_openai_base, verify_ollama_compatible_base
-from yt_summarizer.settings_store import GuiSettings, load_gui_settings, save_gui_settings
+from yt_summarizer.settings_store import (
+    ChannelEntry,
+    GuiSettings,
+    load_gui_settings,
+    save_gui_settings,
+)
 from yt_summarizer.ui.channel_parse import parse_channel_id
 from yt_summarizer.ui.workers import FetchVideosWorker, SummarizeWorker, TestSummaryWorker
 from yt_summarizer.video_pipeline import pipeline_from_gui_settings
@@ -149,26 +155,42 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout(w)
 
         layout.addWidget(
-            QLabel("Channels are identified by a UC… ID (from the channel URL or RSS feed).")
+            QLabel(
+                "Paste an RSS link or channel URL and optionally a display name. "
+                "The list shows “Name (UC…)” so you can tell channels apart."
+            )
         )
 
-        row = QHBoxLayout()
         self._channel_input = QLineEdit()
         self._channel_input.setPlaceholderText(
-            "Paste channel ID or URL (e.g. …?channel_id=UC… or /channel/UC…)"
+            "RSS or channel URL / ID (e.g. …feeds/videos.xml?channel_id=UC… or /channel/UC…)"
         )
+        self._channel_label_input = QLineEdit()
+        self._channel_label_input.setPlaceholderText("Display name (optional, e.g. My favorite channel)")
+
+        form = QFormLayout()
+        form.addRow("Channel URL or ID:", self._channel_input)
+        form.addRow("Display name:", self._channel_label_input)
+        layout.addLayout(form)
+
+        btn_row = QHBoxLayout()
         btn_add = QPushButton("Add channel")
         btn_add.clicked.connect(self._on_add_channel)
         btn_rem = QPushButton("Remove selected")
         btn_rem.setObjectName("secondaryButton")
         btn_rem.clicked.connect(self._on_remove_channel)
-        row.addWidget(self._channel_input)
-        row.addWidget(btn_add)
-        row.addWidget(btn_rem)
-        layout.addLayout(row)
+        btn_update = QPushButton("Apply name to selected")
+        btn_update.setObjectName("secondaryButton")
+        btn_update.setToolTip("Select one channel below, edit Display name above, then click here.")
+        btn_update.clicked.connect(self._on_update_channel_label)
+        btn_row.addWidget(btn_add)
+        btn_row.addWidget(btn_rem)
+        btn_row.addWidget(btn_update)
+        layout.addLayout(btn_row)
 
         self._channel_list = QListWidget()
         self._channel_list.setAlternatingRowColors(True)
+        self._channel_list.itemSelectionChanged.connect(self._on_channel_selection_changed)
         layout.addWidget(self._channel_list)
 
         btn_save = QPushButton("Save channels")
@@ -176,6 +198,54 @@ class MainWindow(QMainWindow):
         layout.addWidget(btn_save)
 
         return w
+
+    @staticmethod
+    def _format_channel_list_text(channel_id: str, label: str) -> str:
+        label = (label or "").strip()
+        return f"{label}  ({channel_id})" if label else channel_id
+
+    def _add_channel_list_item(self, channel_id: str, label: str = "") -> None:
+        item = QListWidgetItem(self._format_channel_list_text(channel_id, label))
+        item.setData(
+            Qt.ItemDataRole.UserRole,
+            {"id": channel_id, "label": (label or "").strip()},
+        )
+        self._channel_list.addItem(item)
+
+    def _channels_from_list_widget(self) -> list[ChannelEntry]:
+        entries: list[ChannelEntry] = []
+        for i in range(self._channel_list.count()):
+            item = self._channel_list.item(i)
+            data = item.data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, dict) and data.get("id"):
+                entries.append(
+                    ChannelEntry(
+                        channel_id=str(data["id"]),
+                        label=str(data.get("label", "")),
+                    )
+                )
+            else:
+                entries.append(ChannelEntry(channel_id=item.text().strip(), label=""))
+        return entries
+
+    def _channel_ids_for_rss(self) -> list[str]:
+        return [e.channel_id for e in self._channels_from_list_widget()]
+
+    def _channel_label_by_id(self) -> dict[str, str]:
+        m: dict[str, str] = {}
+        for e in self._channels_from_list_widget():
+            if e.label.strip():
+                m[e.channel_id] = e.label.strip()
+        return m
+
+    def _on_channel_selection_changed(self) -> None:
+        items = self._channel_list.selectedItems()
+        if len(items) == 1:
+            data = items[0].data(Qt.ItemDataRole.UserRole)
+            if isinstance(data, dict):
+                self._channel_label_input.setText(str(data.get("label", "")))
+        elif not items:
+            self._channel_label_input.clear()
 
     def _build_settings_tab(self) -> QWidget:
         w = QWidget()
@@ -307,7 +377,7 @@ class MainWindow(QMainWindow):
         s = self._settings
         self._channel_list.clear()
         for c in s.channels:
-            self._channel_list.addItem(c)
+            self._add_channel_list_item(c.channel_id, c.label)
 
         self._radio_openai.setChecked(s.use_openai_cloud)
         self._radio_ollama.setChecked(not s.use_openai_cloud)
@@ -328,7 +398,7 @@ class MainWindow(QMainWindow):
 
     def _read_settings_from_forms(self) -> GuiSettings:
         return GuiSettings(
-            channels=[self._channel_list.item(i).text() for i in range(self._channel_list.count())],
+            channels=self._channels_from_list_widget(),
             use_openai_cloud=self._radio_openai.isChecked(),
             llm_base_url=self._ollama_url.text().strip(),
             llm_model=self._model_edit.text().strip() or "llama3.2",
@@ -388,15 +458,37 @@ class MainWindow(QMainWindow):
             )
             return
         for i in range(self._channel_list.count()):
-            if self._channel_list.item(i).text() == cid:
+            existing = self._channel_list.item(i).data(Qt.ItemDataRole.UserRole)
+            if isinstance(existing, dict) and existing.get("id") == cid:
                 QMessageBox.information(self, "Channels", "That channel is already in the list.")
                 return
-        self._channel_list.addItem(cid)
+        label = self._channel_label_input.text()
+        self._add_channel_list_item(cid, label)
         self._channel_input.clear()
+        self._channel_label_input.clear()
 
     def _on_remove_channel(self) -> None:
         for item in self._channel_list.selectedItems():
             self._channel_list.takeItem(self._channel_list.row(item))
+
+    def _on_update_channel_label(self) -> None:
+        items = self._channel_list.selectedItems()
+        if len(items) != 1:
+            QMessageBox.information(
+                self,
+                "Channels",
+                "Select exactly one channel in the list, enter the display name above, "
+                "then click Apply name to selected.",
+            )
+            return
+        item = items[0]
+        data = item.data(Qt.ItemDataRole.UserRole)
+        if not isinstance(data, dict) or not data.get("id"):
+            return
+        new_label = self._channel_label_input.text().strip()
+        data["label"] = new_label
+        item.setData(Qt.ItemDataRole.UserRole, data)
+        item.setText(self._format_channel_list_text(str(data["id"]), new_label))
 
     def _set_busy(self, busy: bool) -> None:
         self._btn_refresh.setEnabled(not busy)
@@ -520,7 +612,7 @@ class MainWindow(QMainWindow):
 
     def _on_refresh_videos(self) -> None:
         self._settings = self._read_settings_from_forms()
-        ch = [self._channel_list.item(i).text() for i in range(self._channel_list.count())]
+        ch = self._channel_ids_for_rss()
         if not ch:
             QMessageBox.warning(self, "Videos", "Add at least one channel on the Channels tab.")
             return
@@ -540,13 +632,15 @@ class MainWindow(QMainWindow):
     def _on_videos_loaded(self, videos: list) -> None:
         refs = list(videos)
         self._video_rows = refs
+        labels = self._channel_label_by_id()
         self._video_table.setRowCount(0)
         for row, v in enumerate(refs):
             self._video_table.insertRow(row)
             cb = QCheckBox()
             cb.setChecked(False)
             self._video_table.setCellWidget(row, 0, cb)
-            self._video_table.setItem(row, 1, QTableWidgetItem(v.channel_id))
+            ch_disp = labels.get(v.channel_id, v.channel_id)
+            self._video_table.setItem(row, 1, QTableWidgetItem(ch_disp))
             self._video_table.setItem(row, 2, QTableWidgetItem(v.title))
             self._video_table.setItem(row, 3, QTableWidgetItem(v.video_id))
             self._video_table.setItem(row, 4, QTableWidgetItem(v.published or ""))

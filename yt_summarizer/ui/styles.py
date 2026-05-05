@@ -178,4 +178,15 @@ QGroupBox::title {
     padding: 0 8px;
     color: #c41230;
 }
+
+QTextBrowser, QTextEdit {
+    background: #ffffff;
+    border: 1px solid #e5e5e5;
+    border-radius: 6px;
+    padding: 8px;
+}
+
+QDialog {
+    background: #fafafa;
+}
 """

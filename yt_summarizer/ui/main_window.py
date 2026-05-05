@@ -7,6 +7,8 @@ import logging
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
+    QDialog,
+    QDialogButtonBox,
     QFormLayout,
     QGroupBox,
     QHBoxLayout,
@@ -23,15 +25,18 @@ from PySide6.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextBrowser,
+    QTextEdit,
     QVBoxLayout,
     QWidget,
 )
 
 from yt_summarizer.channel_monitor import VideoRef
+from yt_summarizer.summarize import FinalSummary
 from yt_summarizer.ollama_check import ollama_origin_from_openai_base, verify_ollama_compatible_base
 from yt_summarizer.settings_store import GuiSettings, load_gui_settings, save_gui_settings
 from yt_summarizer.ui.channel_parse import parse_channel_id
-from yt_summarizer.ui.workers import FetchVideosWorker, SummarizeWorker
+from yt_summarizer.ui.workers import FetchVideosWorker, SummarizeWorker, TestSummaryWorker
 from yt_summarizer.video_pipeline import pipeline_from_gui_settings
 
 logger = logging.getLogger(__name__)
@@ -48,6 +53,7 @@ class MainWindow(QMainWindow):
         self._video_rows: list[VideoRef] = []
         self._fetch_worker: FetchVideosWorker | None = None
         self._sum_worker: SummarizeWorker | None = None
+        self._test_worker: TestSummaryWorker | None = None
 
         central = QWidget()
         self.setCentralWidget(central)
@@ -79,7 +85,8 @@ class MainWindow(QMainWindow):
 
         hint = QLabel(
             "Refresh loads the latest uploads from your saved channels. "
-            "Check the videos you want, then summarize and email."
+            "Check one video and click “Test summary” to preview in a window (no email), "
+            "or check videos and use “Summarize & email selected.”"
         )
         hint.setWordWrap(True)
         hint.setStyleSheet("color: #555;")
@@ -94,11 +101,18 @@ class MainWindow(QMainWindow):
         self._btn_select_none = QPushButton("Clear selection")
         self._btn_select_none.setObjectName("secondaryButton")
         self._btn_select_none.clicked.connect(lambda: self._set_all_checks(False))
+        self._btn_test_summary = QPushButton("Test summary")
+        self._btn_test_summary.setObjectName("secondaryButton")
+        self._btn_test_summary.setToolTip(
+            "Requires a checked video. Shows TL;DR and insights in a dialog (does not send email)."
+        )
+        self._btn_test_summary.clicked.connect(self._on_test_summary)
         self._btn_run = QPushButton("Summarize & email selected")
         self._btn_run.clicked.connect(self._on_summarize_selected)
         bar.addWidget(self._btn_refresh)
         bar.addWidget(self._btn_select_all)
         bar.addWidget(self._btn_select_none)
+        bar.addWidget(self._btn_test_summary)
         bar.addStretch()
         bar.addWidget(self._btn_run)
         layout.addLayout(bar)
@@ -226,6 +240,36 @@ class MainWindow(QMainWindow):
         mail_form.addRow("SMTP password / app password:", self._email_pass)
 
         outer.addWidget(mail_group)
+
+        email_help = QGroupBox("How to set up email")
+        email_help_layout = QVBoxLayout(email_help)
+        help_browser = QTextBrowser()
+        help_browser.setReadOnly(True)
+        help_browser.setOpenExternalLinks(True)
+        help_browser.setMinimumHeight(220)
+        help_browser.setHtml(
+            "<h3>Gmail (typical setup)</h3>"
+            "<ol style='margin-top:8px;'>"
+            "<li>Enable <b>2-Step Verification</b> on your Google Account.</li>"
+            "<li>Open <a href='https://myaccount.google.com/apppasswords'>App passwords</a> "
+            "(Google Account → Security).</li>"
+            "<li>Create an app password for <b>Mail</b> — Google shows a "
+            "<b>16-character password</b>; copy it.</li>"
+            "<li>Here, set <b>SMTP host</b> to <code>smtp.gmail.com</code>, "
+            "<b>port</b> <code>587</code>, and keep <b>Use TLS</b> checked.</li>"
+            "<li><b>From</b>: your full Gmail address. "
+            "<b>To</b>: where summaries should go (can be the same inbox).</li>"
+            "<li><b>SMTP password</b>: paste the <b>app password</b>, "
+            "not your normal Gmail password.</li>"
+            "<li>Leave <b>Dry-run</b> on while testing summaries without sending mail; "
+            "turn it off when you want real emails.</li>"
+            "</ol>"
+            "<p><b>Other providers:</b> use their SMTP documentation "
+            "(often port 587 + STARTTLS). Outlook often uses "
+            "<code>smtp-mail.outlook.com</code>.</p>"
+        )
+        email_help_layout.addWidget(help_browser)
+        outer.addWidget(email_help)
 
         adv = QGroupBox("Advanced")
         adv_form = QFormLayout(adv)
@@ -357,7 +401,122 @@ class MainWindow(QMainWindow):
     def _set_busy(self, busy: bool) -> None:
         self._btn_refresh.setEnabled(not busy)
         self._btn_run.setEnabled(not busy)
+        self._btn_test_summary.setEnabled(not busy)
         self._progress.setVisible(busy)
+
+    @staticmethod
+    def _format_summary_dialog_text(title: str, video_id: str, summary: FinalSummary) -> str:
+        """Plain-text body for the test-summary dialog."""
+        url = f"https://www.youtube.com/watch?v={video_id}"
+        lines = [
+            title,
+            url,
+            "",
+            "── TL;DR ──",
+            *[f"• {b}" for b in summary.tldr_bullets],
+            "",
+            "── Key insights ──",
+            *[f"• {x}" for x in summary.all_key_insights],
+            "",
+            "── Main takeaways ──",
+            *[f"• {x}" for x in summary.main_takeaways],
+            "",
+            "── Timeline ──",
+            *[f"• {x}" for x in summary.timeline],
+        ]
+        return "\n".join(lines)
+
+    def _show_summary_dialog(self, heading: str, body: str) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Test summary")
+        dlg.setMinimumSize(580, 520)
+        lay = QVBoxLayout(dlg)
+        head = QLabel(heading)
+        head.setWordWrap(True)
+        head.setStyleSheet("font-weight: bold; font-size: 14px; color: #c41230;")
+        lay.addWidget(head)
+        text = QTextEdit()
+        text.setReadOnly(True)
+        text.setPlainText(body)
+        text.setStyleSheet("font-family: Consolas, 'Cascadia Mono', monospace; font-size: 12px;")
+        lay.addWidget(text)
+        buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok)
+        buttons.accepted.connect(dlg.accept)
+        lay.addWidget(buttons)
+        dlg.exec()
+
+    def _first_checked_video(self) -> tuple[str, str] | None:
+        """Return (video_id, title) for the first row with the Use checkbox checked."""
+        for row in range(self._video_table.rowCount()):
+            w = self._video_table.cellWidget(row, 0)
+            if isinstance(w, QCheckBox) and w.isChecked():
+                vid_item = self._video_table.item(row, 3)
+                title_item = self._video_table.item(row, 2)
+                if vid_item and title_item:
+                    return (vid_item.text(), title_item.text())
+        return None
+
+    def _on_test_summary(self) -> None:
+        """Summarize first checked video and show results (no email)."""
+        first = self._first_checked_video()
+        if not first:
+            QMessageBox.information(
+                self,
+                "Test summary",
+                "Check the box next to a video in the table, then click Test summary again.",
+            )
+            return
+
+        video_id, title = first
+        self._settings = self._read_settings_from_forms()
+
+        if self._settings.use_openai_cloud:
+            if not self._settings.openai_api_key.strip():
+                QMessageBox.warning(self, "Test summary", "Enter an OpenAI API key for cloud mode.")
+                return
+        else:
+            if not self._settings.llm_base_url.strip():
+                QMessageBox.warning(self, "Test summary", "Enter the Ollama base URL in Settings.")
+                return
+            if "11434" in self._settings.llm_base_url:
+                origin = ollama_origin_from_openai_base(self._settings.llm_base_url)
+                if origin:
+                    err = verify_ollama_compatible_base(origin)
+                    if err:
+                        QMessageBox.critical(self, "Ollama", err)
+                        return
+
+        try:
+            save_gui_settings(self._settings)
+        except OSError:
+            pass
+
+        pipeline = pipeline_from_gui_settings(self._settings)
+        self._set_busy(True)
+        self._progress.setRange(0, 0)
+        self._progress.setVisible(True)
+        self._log.setText("Generating test summary (may take a minute)…")
+
+        self._test_worker = TestSummaryWorker(pipeline, video_id, title)
+        self._test_worker.succeeded.connect(self._on_test_summary_succeeded)
+        self._test_worker.failed.connect(self._on_test_summary_failed)
+        self._test_worker.finished.connect(self._on_test_summary_finished)
+        self._test_worker.start()
+
+    def _on_test_summary_succeeded(self, summary: object, title: str, video_id: str) -> None:
+        if not isinstance(summary, FinalSummary):
+            return
+        body = self._format_summary_dialog_text(title, video_id, summary)
+        short = title if len(title) < 80 else title[:77] + "…"
+        self._show_summary_dialog(short, body)
+
+    def _on_test_summary_failed(self, msg: str) -> None:
+        QMessageBox.critical(self, "Test summary", msg)
+
+    def _on_test_summary_finished(self) -> None:
+        self._set_busy(False)
+        self._progress.setVisible(False)
+        self._log.setText("")
 
     def _on_refresh_videos(self) -> None:
         self._settings = self._read_settings_from_forms()

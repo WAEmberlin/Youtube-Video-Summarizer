@@ -5,7 +5,11 @@ from __future__ import annotations
 from PySide6.QtCore import QThread, Signal
 
 from yt_summarizer.channel_monitor import VideoRef, fetch_recent_videos_for_channel
-from yt_summarizer.video_pipeline import PipelineConfig, summarize_and_deliver_video
+from yt_summarizer.video_pipeline import (
+    PipelineConfig,
+    summarize_and_deliver_video,
+    summarize_video_only,
+)
 
 
 class FetchVideosWorker(QThread):
@@ -55,3 +59,29 @@ class SummarizeWorker(QThread):
             ok, msg = summarize_and_deliver_video(self._pipeline, vid, title)
             self.video_finished.emit(vid, ok, msg)
         self.all_finished.emit()
+
+
+class TestSummaryWorker(QThread):
+    """Run summarization only (no email); emit structured result for a dialog."""
+
+    succeeded = Signal(object, str, str)  # FinalSummary, title, video_id
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        pipeline: PipelineConfig,
+        video_id: str,
+        title: str,
+        parent=None,
+    ) -> None:
+        super().__init__(parent)
+        self._pipeline = pipeline
+        self._video_id = video_id
+        self._title = title
+
+    def run(self) -> None:  # noqa: D102
+        fs, err = summarize_video_only(self._pipeline, self._video_id, self._title)
+        if fs is None:
+            self.failed.emit(err)
+        else:
+            self.succeeded.emit(fs, self._title, self._video_id)

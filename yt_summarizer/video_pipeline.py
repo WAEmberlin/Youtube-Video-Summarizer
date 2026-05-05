@@ -14,7 +14,11 @@ from openai import OpenAI
 from yt_summarizer.chunking import chunk_transcript_with_timestamps
 from yt_summarizer.email_sender import build_summary_email_html, send_html_email
 from yt_summarizer.settings_store import GuiSettings
-from yt_summarizer.summarize import consolidate_summaries, summarize_chunks_parallel
+from yt_summarizer.summarize import (
+    FinalSummary,
+    consolidate_summaries,
+    summarize_chunks_parallel,
+)
 from yt_summarizer.transcript import fetch_transcript_items
 
 logger = logging.getLogger(__name__)
@@ -56,36 +60,33 @@ def use_json_object_for_pipeline(pc: PipelineConfig) -> bool:
     return not bool((pc.llm_base_url or "").strip())
 
 
-def summarize_and_deliver_video(
+def summarize_video_only(
     pc: PipelineConfig,
     video_id: str,
     title: str,
-) -> tuple[bool, str]:
+) -> tuple[FinalSummary | None, str]:
     """
-    Full pipeline for one video.
+    Fetch transcript, chunk, and summarize only (no email).
 
     Returns:
-        (success, message) where message is error text or a short success note.
+        (FinalSummary, "") on success, or (None, error_message).
     """
-    if not pc.dry_run:
-        if not pc.email_from.strip() or not pc.email_to.strip():
-            return False, "Email From and To are required when not in dry-run mode."
     if pc.use_openai_cloud:
         if not (pc.openai_api_key or "").strip():
-            return False, "OpenAI API key is required for cloud mode."
+            return None, "OpenAI API key is required for cloud mode."
     elif not (pc.llm_base_url or "").strip():
-        return False, "Set the Ollama / OpenAI-compatible base URL."
+        return None, "Set the Ollama / OpenAI-compatible base URL."
 
     client = build_llm_client(pc)
     use_json = use_json_object_for_pipeline(pc)
 
     items = fetch_transcript_items(video_id, retry_delay=pc.transcript_retry_delay)
     if not items:
-        return False, "No transcript available for this video."
+        return None, "No transcript available for this video."
 
     chunks = chunk_transcript_with_timestamps(items, chunk_size_words=pc.chunk_size)
     if not chunks:
-        return False, "Transcript produced no chunks."
+        return None, "Transcript produced no chunks."
 
     try:
         chunk_sums = summarize_chunks_parallel(
@@ -104,7 +105,29 @@ def summarize_and_deliver_video(
         )
     except Exception as e:
         logger.exception("Summarization failed")
-        return False, str(e)
+        return None, str(e)
+
+    return final_summary, ""
+
+
+def summarize_and_deliver_video(
+    pc: PipelineConfig,
+    video_id: str,
+    title: str,
+) -> tuple[bool, str]:
+    """
+    Full pipeline for one video.
+
+    Returns:
+        (success, message) where message is error text or a short success note.
+    """
+    if not pc.dry_run:
+        if not pc.email_from.strip() or not pc.email_to.strip():
+            return False, "Email From and To are required when not in dry-run mode."
+
+    final_summary, err = summarize_video_only(pc, video_id, title)
+    if final_summary is None:
+        return False, err
 
     video_url = f"https://www.youtube.com/watch?v={video_id}"
     html = build_summary_email_html(title, video_url, final_summary)

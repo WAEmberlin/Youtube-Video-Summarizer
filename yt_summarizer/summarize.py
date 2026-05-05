@@ -12,6 +12,7 @@ from typing import Any
 
 from openai import OpenAI
 
+from yt_summarizer import config
 from yt_summarizer.chunking import TranscriptChunk
 
 logger = logging.getLogger(__name__)
@@ -60,20 +61,39 @@ def _parse_chunk_json(content: str) -> tuple[list[str], list[str]]:
     return [str(b) for b in bullets], [str(i) for i in insights]
 
 
+def _effective_json_mode(use_json_object: bool | None) -> bool:
+    if use_json_object is not None:
+        return use_json_object
+    return config.use_json_object_response()
+
+
+def _completion_extra_kwargs(use_json_object: bool | None = None) -> dict[str, Any]:
+    if _effective_json_mode(use_json_object):
+        return {"response_format": {"type": "json_object"}}
+    return {}
+
+
 def summarize_chunk(
     client: OpenAI,
     model: str,
     chunk: TranscriptChunk,
+    use_json_object: bool | None = None,
 ) -> ChunkSummary:
     """
     Summarize a single transcript chunk using the chat completions API.
 
     Returns bullet points and key insights as structured JSON.
     """
-    system = (
+    strict_json = (
         "You summarize video transcript excerpts. Reply with compact, accurate notes. "
-        "Output must be valid JSON only."
+        "Output must be a single valid JSON object only, no markdown fences or commentary."
     )
+    relaxed_json = (
+        "You summarize video transcript excerpts. Reply with compact, accurate notes. "
+        "Your entire reply must be one JSON object only (no markdown code fences), with keys "
+        "bullet_summary (array of strings) and key_insights (array of strings)."
+    )
+    system = strict_json if _effective_json_mode(use_json_object) else relaxed_json
     user = (
         "Summarize this transcript chunk. Return JSON with exactly these keys:\n"
         '- "bullet_summary": array of short bullet strings (the section summary)\n'
@@ -82,12 +102,12 @@ def summarize_chunk(
     )
     resp = client.chat.completions.create(
         model=model,
-        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         temperature=0.3,
+        **_completion_extra_kwargs(use_json_object),
     )
     raw = (resp.choices[0].message.content or "").strip()
     bullets, insights = _parse_chunk_json(raw)
@@ -103,6 +123,7 @@ def summarize_chunks_parallel(
     model: str,
     chunks: list[TranscriptChunk],
     max_workers: int = 4,
+    use_json_object: bool | None = None,
 ) -> list[ChunkSummary]:
     """
     Summarize all chunks, optionally in parallel.
@@ -116,7 +137,10 @@ def summarize_chunks_parallel(
 
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
         fut_map = {
-            ex.submit(summarize_chunk, client, model, ch): ch.index for ch in chunks
+            ex.submit(
+                summarize_chunk, client, model, ch, use_json_object
+            ): ch.index
+            for ch in chunks
         }
         for fut in as_completed(fut_map):
             try:
@@ -141,6 +165,7 @@ def consolidate_summaries(
     model: str,
     video_title: str,
     chunk_summaries: list[ChunkSummary],
+    use_json_object: bool | None = None,
 ) -> FinalSummary:
     """
     Second pass: merge chunk-level summaries into TL;DR, takeaways, and a timeline.
@@ -155,10 +180,16 @@ def consolidate_summaries(
         )
         all_insights.extend(cs.key_insights)
 
-    system = (
+    strict_system = (
         "You combine partial summaries of one video into a coherent whole. "
         "Use only the provided chunk summaries. Output valid JSON only."
     )
+    relaxed_system = (
+        "You combine partial summaries of one video into a coherent whole. "
+        "Use only the provided chunk summaries. Reply with a single JSON object only "
+        "(no markdown fences), keys tldr_bullets (array), main_takeaways (array), timeline (array)."
+    )
+    system = strict_system if _effective_json_mode(use_json_object) else relaxed_system
     user = (
         f'Video title: "{video_title}"\n\n'
         "Here are per-chunk summaries:\n\n"
@@ -171,12 +202,12 @@ def consolidate_summaries(
     )
     resp = client.chat.completions.create(
         model=model,
-        response_format={"type": "json_object"},
         messages=[
             {"role": "system", "content": system},
             {"role": "user", "content": user},
         ],
         temperature=0.3,
+        **_completion_extra_kwargs(use_json_object),
     )
     raw = (resp.choices[0].message.content or "").strip()
     data = json.loads(_extract_json_object(raw))

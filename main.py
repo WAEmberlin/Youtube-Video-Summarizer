@@ -17,8 +17,8 @@ from yt_summarizer.chunking import chunk_transcript_with_timestamps
 from yt_summarizer.email_sender import build_summary_email_html, send_html_email
 from yt_summarizer.processed_store import load_processed_video_ids, save_processed_video_ids
 from yt_summarizer.summarize import consolidate_summaries, summarize_chunks_parallel
+from yt_summarizer.ollama_check import ollama_origin_from_openai_base, verify_ollama_compatible_base
 from yt_summarizer.transcript import fetch_transcript_items
-from openai import OpenAI
 
 
 def _setup_logging() -> None:
@@ -40,18 +40,31 @@ def run_cycle() -> int:
     _setup_logging()
     log = logging.getLogger("yt_summarizer.main")
 
-    if not config.OPENAI_API_KEY:
-        log.error("OPENAI_API_KEY is not set. Export it or edit config.py.")
+    if not config.llm_config_ok():
+        log.error(
+            "LLM not configured: set OPENAI_API_KEY for OpenAI, or use Ollama (defaults in config)."
+        )
         return 1
-    if not config.EMAIL_FROM or not config.EMAIL_TO:
-        log.error("EMAIL_FROM and EMAIL_TO must be set.")
+    if "11434" in config.OPENAI_BASE_URL:
+        origin = ollama_origin_from_openai_base(config.OPENAI_BASE_URL)
+        if origin:
+            ollama_err = verify_ollama_compatible_base(origin)
+            if ollama_err:
+                log.error("%s", ollama_err)
+                return 1
+    if not config.DRY_RUN and (not config.EMAIL_FROM or not config.EMAIL_TO):
+        log.error("EMAIL_FROM and EMAIL_TO must be set (or set DRY_RUN=1 in .env to skip email).")
         return 1
+    if config.DRY_RUN:
+        log.info("Dry-run mode: summaries go to the log only (no email). Configure EMAIL_* and DRY_RUN=0 to send.")
     if not config.CHANNEL_IDS:
         log.error("CHANNEL_IDS is empty. Add at least one channel ID in config.py.")
         return 1
 
     processed = load_processed_video_ids(config.PROCESSED_PATH)
-    client = OpenAI(api_key=config.OPENAI_API_KEY)
+    client = config.build_openai_client()
+    if config.OPENAI_BASE_URL:
+        log.info("Using LLM at %s model=%s", config.OPENAI_BASE_URL, config.OPENAI_MODEL)
     any_work = False
     had_errors = False
 
@@ -115,25 +128,33 @@ def run_cycle() -> int:
         html = build_summary_email_html(ref.title, video_url, final_summary)
         subject = f"[yt_summarizer] {ref.title}"
 
-        try:
-            send_html_email(
-                smtp_host=config.EMAIL_SMTP_HOST,
-                smtp_port=config.EMAIL_SMTP_PORT,
-                use_tls=config.EMAIL_USE_TLS,
-                from_addr=config.EMAIL_FROM,
-                to_addr=config.EMAIL_TO,
-                password=config.EMAIL_PASSWORD,
-                subject=subject,
-                html_body=html,
-            )
-        except Exception as e:
-            log.exception("Email send failed for %s: %s", ref.video_id, e)
-            had_errors = True
-            continue
+        if config.DRY_RUN:
+            log.info("DRY_RUN summary for %s", ref.title)
+            log.info("Link: %s", video_url)
+            log.info("TL;DR: %s", final_summary.tldr_bullets)
+            log.info("Key insights: %s", final_summary.all_key_insights)
+            log.info("Main takeaways: %s", final_summary.main_takeaways)
+            log.info("Timeline: %s", final_summary.timeline)
+        else:
+            try:
+                send_html_email(
+                    smtp_host=config.EMAIL_SMTP_HOST,
+                    smtp_port=config.EMAIL_SMTP_PORT,
+                    use_tls=config.EMAIL_USE_TLS,
+                    from_addr=config.EMAIL_FROM,
+                    to_addr=config.EMAIL_TO,
+                    password=config.EMAIL_PASSWORD,
+                    subject=subject,
+                    html_body=html,
+                )
+            except Exception as e:
+                log.exception("Email send failed for %s: %s", ref.video_id, e)
+                had_errors = True
+                continue
 
         processed.add(ref.video_id)
         save_processed_video_ids(config.PROCESSED_PATH, processed)
-        log.info("Done: emailed summary for %s", ref.video_id)
+        log.info("Done: %s for %s", "logged summary" if config.DRY_RUN else "emailed summary", ref.video_id)
 
     if not any_work:
         log.info("No new videos to process.")
